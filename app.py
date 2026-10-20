@@ -94,15 +94,17 @@ def recheck_seat(seat):
         session.close()
 
 # =========================================================
-# مهمة الخلفية (Background Worker)
+# مهمة الخلفية (Background Worker) - تم تحسين استهلاك الذاكرة جداً
 # =========================================================
 def run_scraper():
     try:
+        # تنظيف استباقي للذاكرة قبل البدء
+        gc.collect()
+        
         status_info["running"] = True
         status_info["message"] = "🔍 جاري البحث عن ملف الأرقام المطلوبة..."
         print("🔍 جاري البحث عن ملف الأرقام المطلوبة...", flush=True)
 
-        # البحث الذكي عن ملف المشاكل (حتى لو اختلف حجم الأحرف في الاسم)
         target_problem_file = PROBLEMS_FILE
         if not os.path.exists(target_problem_file):
             csv_files = [f for f in os.listdir('.') if f.lower().endswith('.csv')]
@@ -111,36 +113,45 @@ def run_scraper():
                 target_problem_file = prob_candidates[0]
             else:
                 status_info["running"] = False
-                status_info["message"] = f"❌ لم يتم العثور على {PROBLEMS_FILE}! الملفات الموجودة حالياً في السيرفر: {csv_files}"
-                print(status_info["message"], flush=True)
+                status_info["message"] = f"❌ لم يتم العثور على {PROBLEMS_FILE}!"
                 return
 
-        df_prob = pd.read_csv(target_problem_file)
-        col_name = 'Seat' if 'Seat' in df_prob.columns else df_prob.columns[0]
-        seats_to_recheck = pd.to_numeric(df_prob[col_name], errors='coerce').dropna().astype(int).unique().tolist()
-        del df_prob
-        gc.collect()
+        # 🔥 قراءة ملف المشاكل بأسلوب الدفعات (Chunks) لمنع الانفجار في الذاكرة
+        seats_to_recheck_set = set()
+        for chunk in pd.read_csv(target_problem_file, usecols=[0], chunksize=10000):
+            col_name = chunk.columns[0]
+            valid_seats = pd.to_numeric(chunk[col_name], errors='coerce').dropna().astype(int)
+            seats_to_recheck_set.update(valid_seats)
+            del chunk
+            gc.collect()
 
-        total_initial = len(seats_to_recheck)
+        total_initial = len(seats_to_recheck_set)
         status_info["total_initial"] = total_initial
 
-        # الاستئناف التلقائي إذا كان ملف التحديث القديم موجوداً
+        # 🔥 الاستئناف التلقائي بقراءة التحديثات على دفعات
+        done_seats = set()
         if os.path.exists(LIVE_FILE):
             try:
-                df_live = pd.read_csv(LIVE_FILE)
-                if not df_live.empty:
-                    live_col = 'Seat' if 'Seat' in df_live.columns else df_live.columns[0]
-                    done_seats = set(pd.to_numeric(df_live[live_col], errors='coerce').dropna().astype(int).tolist())
-                    seats_to_recheck = [s for s in seats_to_recheck if s not in done_seats]
-                    status_info["already_done"] = total_initial - len(seats_to_recheck)
-                    print(f"🔄 تم تخطي {status_info['already_done']:,} رقم منجز مسبقاً.", flush=True)
-                del df_live
-                gc.collect()
+                for chunk in pd.read_csv(LIVE_FILE, usecols=[0], chunksize=10000):
+                    live_col = chunk.columns[0]
+                    valid_done = pd.to_numeric(chunk[live_col], errors='coerce').dropna().astype(int)
+                    done_seats.update(valid_done)
+                    del chunk
+                    gc.collect()
+                
+                seats_to_recheck_set.difference_update(done_seats)
+                status_info["already_done"] = total_initial - len(seats_to_recheck_set)
+                print(f"🔄 تم تخطي {status_info['already_done']:,} رقم منجز مسبقاً.", flush=True)
             except Exception as e:
                 print(f"⚠️ تحذير أثناء قراءة ملف التحديث: {e}", flush=True)
         else:
             with open(LIVE_FILE, "w", newline="", encoding="utf-8-sig") as f:
                 csv.writer(f).writerow(["Seat", "Name", "Result", "Percentage"])
+
+        # تحويل الـ Set إلى List للعمل بها
+        seats_to_recheck = list(seats_to_recheck_set)
+        del seats_to_recheck_set, done_seats
+        gc.collect()
 
         if not seats_to_recheck:
             status_info["running"] = False
